@@ -27,8 +27,9 @@ def load_data():
         apt_df['건축년도'] = apt_df.get('사용승인일', apt_df.get('건축년도', pd.Series([0]*len(apt_df)))).fillna(0)
         apt_df['연식'] = apt_df['건축년도'].astype(str).str[:4]
         
+        SUDO_PREFIX = ("11", "28", "41")  # 서울, 인천, 경기
         region_df = pd.read_csv('region_code.csv', encoding='utf-8')
-        region_map = {str(row['법정동코드'])[:5]: str(row['법정동명']) for _, row in region_df.iterrows() if len(str(row['법정동코드'])) >= 5 and " " in str(row['법정동명'])}
+        region_map = {str(row['법정동코드'])[:5]: str(row['법정동명']) for _, row in region_df.iterrows() if len(str(row['법정동코드'])) >= 5 and " " in str(row['법정동명']) and str(row['법정동코드'])[:2] in SUDO_PREFIX}
         return apt_df, region_map
     except Exception as e:
         st.error(f"❌ 데이터 로드 오류: {e}")

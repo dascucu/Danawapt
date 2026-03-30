@@ -37,12 +37,14 @@ def load_static_data():
         .str[:4]
     )
 
+    SUDO_PREFIX = ("11", "28", "41")  # 서울, 인천, 경기
+
     region_df = pd.read_csv("region_code.csv", encoding="utf-8")
     region_map = {}
     for _, row in region_df.iterrows():
         code_str = str(row["법정동코드"])
         name_str = str(row["법정동명"])
-        if len(code_str) >= 5 and " " in name_str:
+        if len(code_str) >= 5 and " " in name_str and code_str[:2] in SUDO_PREFIX:
             key = code_str[:5]
             if key not in region_map:
                 region_map[key] = name_str
