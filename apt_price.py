@@ -15,7 +15,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- 1. 기본 화면 설정 ---
 st.set_page_config(page_title="나만의 부동산 대시보드", page_icon="🏢", layout="wide")
 
-API_KEY = os.getenv("API_KEY", "")
+API_KEY = st.secrets.get("API_KEY", os.getenv("API_KEY", ""))
 API_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
 
 # --- 2. 데이터 불러오기 ---

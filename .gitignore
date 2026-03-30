@@ -10,7 +10,7 @@ __pycache__/
 dist/
 build/
 
-# Streamlit
+# Streamlit (로컬 secrets - API키 포함, 절대 커밋 금지)
 .streamlit/secrets.toml
 
 # OS

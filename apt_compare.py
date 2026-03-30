@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-API_KEY = os.getenv("API_KEY", "")
+API_KEY = st.secrets.get("API_KEY", os.getenv("API_KEY", ""))
 API_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
 MAX_COMPARE = 5  # 최대 비교 아파트 수
 
