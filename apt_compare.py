@@ -27,6 +27,17 @@ MAX_COMPARE = 5  # 최대 비교 아파트 수
 
 COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"]
 
+# ── 면적 구간 상수 ──────────────────────────────────────────────────────────────
+AREA_BRACKETS = {
+    "전체 면적":           None,
+    "소형 (~60㎡)":        (0,   60),
+    "중형 (60~85㎡)":      (60,  85),
+    "중대형 (85~102㎡)":   (85,  102),
+    "대형 (102㎡~)":       (102, None),
+}
+AREA_BRACKET_DEFAULT = "중형 (60~85㎡)"
+AREA_BRACKET_KEYS    = list(AREA_BRACKETS.keys())
+
 # ── 데이터 로드 ────────────────────────────────────────────────────────────────
 @st.cache_data
 def load_static_data():
@@ -130,7 +141,21 @@ def _build_months(start_ym: str, end_ym: str) -> list:
     return months
 
 
-def _aggregate_month(ym: str, transactions: list) -> dict:
+def _aggregate_month(ym: str, transactions: list, area_range: tuple | None = None) -> dict:
+    if area_range is not None:
+        lo, hi = area_range
+        transactions = [
+            t for t in transactions
+            if t["area"] is not None
+            and (lo == 0 or t["area"] > lo)
+            and (hi is None or t["area"] <= hi)
+        ]
+    if not transactions:
+        return {
+            "거래년월": f"{ym[:4]}-{ym[4:]}",
+            "평균가": None, "최저가": None, "최고가": None,
+            "거래건수": 0, **_EMPTY_ROW_EXTRA,
+        }
     prices   = [t["price"] for t in transactions]
     areas    = [t["area"] for t in transactions if t["area"] is not None]
     ppyg_vals = [t["price"] / (t["area"] / 3.3058) for t in transactions if t["area"] and t["area"] > 0]
@@ -162,7 +187,7 @@ def _add_mom(result_df: pd.DataFrame) -> pd.DataFrame:
     return result_df
 
 
-def fetch_monthly_data(lawd_cd: str, apt_name: str, start_ym: str, end_ym: str) -> pd.DataFrame:
+def fetch_monthly_data(lawd_cd: str, apt_name: str, start_ym: str, end_ym: str, area_range: tuple | None = None) -> pd.DataFrame:
     """API를 병렬 호출해 월별 거래 통계를 DataFrame으로 반환. 각 월은 캐시됨."""
     months = _build_months(start_ym, end_ym)
 
@@ -183,7 +208,7 @@ def fetch_monthly_data(lawd_cd: str, apt_name: str, start_ym: str, end_ym: str) 
         data = raw[ym]
         txns = data.get("transactions", [])
         if data["status"] == "ok" and txns:
-            rows.append(_aggregate_month(ym, txns))
+            rows.append(_aggregate_month(ym, txns, area_range=area_range))
         else:
             rows.append({
                 "거래년월": f"{ym[:4]}-{ym[4:]}",
@@ -250,7 +275,22 @@ with left_col:
     # 담기 버튼
     if sel_apt_display and sel_apt_display != "아파트를 선택하세요":
         orig_name = display_map[sel_apt_display]
-        label = f"{sel_region} · {orig_name}"
+
+        sel_bracket = st.selectbox(
+            "면적 구간",
+            AREA_BRACKET_KEYS,
+            index=AREA_BRACKET_KEYS.index(AREA_BRACKET_DEFAULT),
+            key="sel_bracket",
+            help=(
+                "단지 내 전용면적이 다른 타입(예: 59㎡, 84㎡)이 섞여 거래될 경우 "
+                "특정 달에 큰 면적 거래가 몰리면 평균가가 오른 것처럼 보일 수 있습니다. "
+                "면적 구간을 지정하면 같은 타입끼리만 비교합니다."
+            ),
+        )
+        area_range = AREA_BRACKETS[sel_bracket]
+        bracket_tag = f" [{sel_bracket}]" if sel_bracket != "전체 면적" else " [전체]"
+        label = f"{sel_region} · {orig_name}{bracket_tag}"
+
         already_in = any(item["label"] == label for item in st.session_state["compare_list"])
         full = len(st.session_state["compare_list"]) >= MAX_COMPARE
 
@@ -265,6 +305,8 @@ with left_col:
                     "lawd_cd": region_options[sel_region],
                     "apt_name": orig_name,
                     "region": sel_region,
+                    "area_range": area_range,
+                    "bracket_label": sel_bracket,
                 })
                 st.rerun()
 
@@ -341,7 +383,11 @@ if "run_btn" in dir() and run_btn and st.session_state["compare_list"]:
                 idx / total,
                 text=f"[{idx+1}/{total}] {item['label']} 조회 중... (최대 {n_months}건 API 호출)",
             )
-            df = fetch_monthly_data(item["lawd_cd"], item["apt_name"], start_ym, end_ym)
+            df = fetch_monthly_data(
+                item["lawd_cd"], item["apt_name"],
+                start_ym, end_ym,
+                area_range=item.get("area_range"),
+            )
             st.session_state["compare_results"][item["label"]] = df
         progress.progress(1.0, text="완료!")
         time.sleep(0.3)
