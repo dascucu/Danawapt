@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 import time
 import datetime
 import plotly.graph_objects as go
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -68,98 +69,87 @@ _EMPTY_ROW_EXTRA = {
 }
 
 
-def fetch_monthly_data(lawd_cd: str, apt_name: str, start_ym: str, end_ym: str):
-    """API를 호출해 월별 거래 통계를 DataFrame으로 반환."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_one_month(lawd_cd: str, apt_name: str, deal_ymd: str) -> dict:
+    """단일 월 API 호출. 결과를 1시간 동안 캐시 (같은 조합 재호출 없음)."""
+    url = (
+        f"{API_URL}?serviceKey={API_KEY}"
+        f"&pageNo=1&numOfRows=1000"
+        f"&LAWD_CD={lawd_cd}&DEAL_YMD={deal_ymd}"
+    )
+    try:
+        res = requests.get(url, timeout=10, verify=False)
+        if res.status_code != 200:
+            return {"status": "error", "transactions": []}
+        root = ET.fromstring(res.content)
+        header = root.find("header")
+        if header is None or header.findtext("resultCode") != "000":
+            return {"status": "empty", "transactions": []}
+
+        transactions = []
+        for item in root.findall(".//item"):
+            name = (item.findtext("aptNm") or "").strip()
+            if name != apt_name.strip():
+                continue
+            price_str = (item.findtext("dealAmount") or "0").replace(",", "").strip()
+            try:
+                p = int(price_str)
+                if p <= 0:
+                    continue
+            except ValueError:
+                continue
+            try:
+                area = float((item.findtext("excluUseAr") or "").strip())
+                area = area if area > 0 else None
+            except (ValueError, TypeError):
+                area = None
+            try:
+                floor_val = int((item.findtext("floor") or "").strip())
+            except (ValueError, TypeError):
+                floor_val = None
+            gbn = (item.findtext("dealingGbn") or "").strip()
+            transactions.append({"price": p, "area": area, "floor": floor_val, "dealingGbn": gbn})
+
+        return {"status": "ok", "transactions": transactions}
+    except Exception:
+        return {"status": "error", "transactions": []}
+
+
+def _build_months(start_ym: str, end_ym: str) -> list:
+    months = []
     cur_y, cur_m = int(start_ym[:4]), int(start_ym[4:])
     end_y, end_m = int(end_ym[:4]), int(end_ym[4:])
-    rows = []
-
     while True:
-        deal_ymd = f"{cur_y}{cur_m:02d}"
-        url = (
-            f"{API_URL}?serviceKey={API_KEY}"
-            f"&pageNo=1&numOfRows=1000"
-            f"&LAWD_CD={lawd_cd}&DEAL_YMD={deal_ymd}"
-        )
-        try:
-            time.sleep(0.08)
-            res = requests.get(url, timeout=10, verify=False)
-            if res.status_code == 200:
-                root = ET.fromstring(res.content)
-                header = root.find("header")
-                if header is not None and header.findtext("resultCode") == "000":
-                    transactions = []
-                    for item in root.findall(".//item"):
-                        name = (item.findtext("aptNm") or "").strip()
-                        if name == apt_name.strip():
-                            price_str = (item.findtext("dealAmount") or "0").replace(",", "").strip()
-                            try:
-                                p = int(price_str)
-                                if p <= 0:
-                                    continue
-                            except ValueError:
-                                continue
-                            # 전용면적
-                            try:
-                                area = float((item.findtext("excluUseAr") or "").strip())
-                                area = area if area > 0 else None
-                            except (ValueError, TypeError):
-                                area = None
-                            # 층
-                            try:
-                                floor_val = int((item.findtext("floor") or "").strip())
-                            except (ValueError, TypeError):
-                                floor_val = None
-                            gbn = (item.findtext("dealingGbn") or "").strip()
-                            transactions.append({
-                                "price": p, "area": area,
-                                "floor": floor_val, "dealingGbn": gbn,
-                            })
-
-                    if transactions:
-                        prices = [t["price"] for t in transactions]
-                        areas = [t["area"] for t in transactions if t["area"] is not None]
-                        ppyg_vals = [
-                            t["price"] / (t["area"] / 3.3058)
-                            for t in transactions
-                            if t["area"] and t["area"] > 0
-                        ]
-                        direct = sum(1 for t in transactions if "직거래" in t["dealingGbn"])
-                        rows.append({
-                            "거래년월": f"{deal_ymd[:4]}-{deal_ymd[4:]}",
-                            "평균가": round(sum(prices) / len(prices)),
-                            "최저가": min(prices),
-                            "최고가": max(prices),
-                            "거래건수": len(prices),
-                            "평균_전용면적": round(sum(areas) / len(areas), 1) if areas else None,
-                            "평균_평당가": round(sum(ppyg_vals) / len(ppyg_vals)) if ppyg_vals else None,
-                            "직거래수": direct,
-                            "전월대비_등락": None,  # 후처리에서 채움
-                        })
-                    else:
-                        rows.append({
-                            "거래년월": f"{deal_ymd[:4]}-{deal_ymd[4:]}",
-                            "평균가": None, "최저가": None, "최고가": None, "거래건수": 0,
-                            **_EMPTY_ROW_EXTRA,
-                        })
-        except Exception:
-            rows.append({
-                "거래년월": f"{deal_ymd[:4]}-{deal_ymd[4:]}",
-                "평균가": None, "최저가": None, "최고가": None, "거래건수": -1,
-                **_EMPTY_ROW_EXTRA,
-            })
-
+        months.append(f"{cur_y}{cur_m:02d}")
         if cur_y == end_y and cur_m == end_m:
             break
         cur_m += 1
         if cur_m > 12:
             cur_m = 1
             cur_y += 1
+    return months
 
-    # 전월대비 등락률 후처리
-    result_df = pd.DataFrame(rows)
-    prev = None
-    mom = []
+
+def _aggregate_month(ym: str, transactions: list) -> dict:
+    prices   = [t["price"] for t in transactions]
+    areas    = [t["area"] for t in transactions if t["area"] is not None]
+    ppyg_vals = [t["price"] / (t["area"] / 3.3058) for t in transactions if t["area"] and t["area"] > 0]
+    direct   = sum(1 for t in transactions if "직거래" in t["dealingGbn"])
+    return {
+        "거래년월": f"{ym[:4]}-{ym[4:]}",
+        "평균가": round(sum(prices) / len(prices)),
+        "최저가": min(prices),
+        "최고가": max(prices),
+        "거래건수": len(prices),
+        "평균_전용면적": round(sum(areas) / len(areas), 1) if areas else None,
+        "평균_평당가": round(sum(ppyg_vals) / len(ppyg_vals)) if ppyg_vals else None,
+        "직거래수": direct,
+        "전월대비_등락": None,
+    }
+
+
+def _add_mom(result_df: pd.DataFrame) -> pd.DataFrame:
+    prev, mom = None, []
     for _, r in result_df.iterrows():
         cur_avg = r["평균가"]
         if prev is not None and prev > 0 and cur_avg is not None and cur_avg > 0:
@@ -170,6 +160,39 @@ def fetch_monthly_data(lawd_cd: str, apt_name: str, start_ym: str, end_ym: str):
             prev = cur_avg
     result_df["전월대비_등락"] = mom
     return result_df
+
+
+def fetch_monthly_data(lawd_cd: str, apt_name: str, start_ym: str, end_ym: str) -> pd.DataFrame:
+    """API를 병렬 호출해 월별 거래 통계를 DataFrame으로 반환. 각 월은 캐시됨."""
+    months = _build_months(start_ym, end_ym)
+
+    # 병렬 API 호출 (max_workers=8 → API 30TPS 한도 내 안전)
+    raw: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_ym = {
+            executor.submit(_fetch_one_month, lawd_cd, apt_name, ym): ym
+            for ym in months
+        }
+        for future in as_completed(future_to_ym):
+            ym = future_to_ym[future]
+            raw[ym] = future.result()
+
+    # 월 순서대로 집계
+    rows = []
+    for ym in months:
+        data = raw[ym]
+        txns = data.get("transactions", [])
+        if data["status"] == "ok" and txns:
+            rows.append(_aggregate_month(ym, txns))
+        else:
+            rows.append({
+                "거래년월": f"{ym[:4]}-{ym[4:]}",
+                "평균가": None, "최저가": None, "최고가": None,
+                "거래건수": 0 if data["status"] == "empty" else -1,
+                **_EMPTY_ROW_EXTRA,
+            })
+
+    return _add_mom(pd.DataFrame(rows))
 
 
 def format_price(val):
@@ -295,17 +318,34 @@ with right_col:
 # ── 비교 실행 ──────────────────────────────────────────────────────────────────
 if "run_btn" in dir() and run_btn and st.session_state["compare_list"]:
     start_ym = start_date.strftime("%Y%m")
-    end_ym = end_date.strftime("%Y%m")
-    total = len(st.session_state["compare_list"])
+    end_ym   = end_date.strftime("%Y%m")
+    range_key = f"{start_ym}_{end_ym}"
 
-    progress = st.progress(0, text="데이터를 가져오는 중...")
-    for idx, item in enumerate(st.session_state["compare_list"]):
-        progress.progress((idx) / total, text=f"[{idx+1}/{total}] {item['label']} 조회 중...")
-        df = fetch_monthly_data(item["lawd_cd"], item["apt_name"], start_ym, end_ym)
-        st.session_state["compare_results"][item["label"]] = df
-    progress.progress(1.0, text="완료!")
-    time.sleep(0.4)
-    progress.empty()
+    # 날짜 범위가 바뀌면 이전 결과 초기화
+    if st.session_state.get("last_range") != range_key:
+        st.session_state["compare_results"] = {}
+        st.session_state["last_range"] = range_key
+
+    # 아직 로드되지 않은 아파트만 추려서 호출
+    pending = [item for item in st.session_state["compare_list"]
+               if item["label"] not in st.session_state["compare_results"]]
+    total = len(pending)
+
+    if total == 0:
+        st.toast("모든 데이터가 이미 로드되어 있습니다.", icon="✅")
+    else:
+        n_months = len(_build_months(start_ym, end_ym))
+        progress = st.progress(0, text="데이터를 가져오는 중...")
+        for idx, item in enumerate(pending):
+            progress.progress(
+                idx / total,
+                text=f"[{idx+1}/{total}] {item['label']} 조회 중... (최대 {n_months}건 API 호출)",
+            )
+            df = fetch_monthly_data(item["lawd_cd"], item["apt_name"], start_ym, end_ym)
+            st.session_state["compare_results"][item["label"]] = df
+        progress.progress(1.0, text="완료!")
+        time.sleep(0.3)
+        progress.empty()
 
 # ── 결과 출력 ──────────────────────────────────────────────────────────────────
 if st.session_state["compare_results"]:

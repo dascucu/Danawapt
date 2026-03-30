@@ -4,8 +4,8 @@ import pandas as pd
 import requests
 import urllib3
 import xml.etree.ElementTree as ET
-import time
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -75,59 +75,73 @@ if selected_region != "지역을 선택하세요":
             if end_date < start_date:
                 st.sidebar.error("종료월이 시작월보다 앞설 수 없습니다.")
             elif st.sidebar.button("📊 시세 조회 시작", use_container_width=True):
-                progress_bar = st.progress(0, text="데이터를 서버에서 가져오는 중...")
-
+                # 월 목록 생성
+                months = []
                 cur_y, cur_m = int(start_ym[:4]), int(start_ym[4:])
                 end_y, end_m = int(end_ym[:4]), int(end_ym[4:])
-                total_months = (end_y - cur_y) * 12 + (end_m - cur_m) + 1
-
-                results = []
-                month_count = 0
-
                 while True:
-                    deal_ymd = f"{cur_y}{cur_m:02d}"
-                    ym_format = f"{deal_ymd[:4]}-{deal_ymd[4:]}"
-                    full_url = f"{API_URL}?serviceKey={API_KEY}&pageNo=1&numOfRows=1000&LAWD_CD={lawd_cd}&DEAL_YMD={deal_ymd}"
-
-                    try:
-                        time.sleep(0.1)
-                        res = requests.get(full_url, timeout=10, verify=False)
-
-                        if res.status_code == 200:
-                            root = ET.fromstring(res.content)
-                            header = root.find("header")
-
-                            if header is not None and header.findtext("resultCode") == "000":
-                                items = root.findall(".//item")
-                                total_amt, count, prices = 0, 0, []
-
-                                for item in items:
-                                    cur_apt_name = (item.findtext('aptNm') or item.findtext('아파트') or "").strip()
-                                    if cur_apt_name == original_apt_name.strip():
-                                        price_str = item.findtext('dealAmount') or item.findtext('거래금액') or "0"
-                                        price = int(price_str.replace(',', '').strip())
-                                        if price > 0:
-                                            total_amt += price; count += 1; prices.append(price)
-
-                                if count > 0:
-                                    prices.sort()
-                                    results.append({"거래년월": ym_format, "평균가(만원)": round(total_amt / count), "최저가(만원)": prices[0], "최고가(만원)": prices[-1], "거래건수": count, "비고": "정상"})
-                                else:
-                                    results.append({"거래년월": ym_format, "평균가(만원)": 0, "최저가(만원)": 0, "최고가(만원)": 0, "거래건수": 0, "비고": "거래 없음"})
-                            else:
-                                msg = header.findtext("resultMsg") if header is not None else "응답 헤더 없음"
-                                results.append({"거래년월": ym_format, "평균가(만원)": 0, "최저가(만원)": 0, "최고가(만원)": 0, "거래건수": -1, "비고": f"서버 응답 에러 ({msg})"})
-                        else:
-                            results.append({"거래년월": ym_format, "평균가(만원)": 0, "최저가(만원)": 0, "최고가(만원)": 0, "거래건수": -1, "비고": f"HTTP 에러 ({res.status_code})"})
-                    except Exception as e:
-                        results.append({"거래년월": ym_format, "평균가(만원)": 0, "최저가(만원)": 0, "최고가(만원)": 0, "거래건수": -1, "비고": f"통신 오류 ({e})"})
-
-                    month_count += 1
-                    progress_bar.progress(min(month_count / total_months, 1.0), text=f"{deal_ymd[:4]}년 {deal_ymd[4:]}월 조회 중...")
-
-                    if cur_y == end_y and cur_m == end_m: break
+                    months.append(f"{cur_y}{cur_m:02d}")
+                    if cur_y == end_y and cur_m == end_m:
+                        break
                     cur_m += 1
-                    if cur_m > 12: cur_m = 1; cur_y += 1
+                    if cur_m > 12:
+                        cur_m = 1; cur_y += 1
+
+                progress_bar = st.progress(0, text=f"총 {len(months)}개월 병렬 조회 중...")
+
+                # 단일 월 캐시 fetch (1시간 TTL)
+                @st.cache_data(ttl=3600, show_spinner=False)
+                def _fetch_month_price(lcd, apt, ym):
+                    url = f"{API_URL}?serviceKey={API_KEY}&pageNo=1&numOfRows=1000&LAWD_CD={lcd}&DEAL_YMD={ym}"
+                    try:
+                        res = requests.get(url, timeout=10, verify=False)
+                        if res.status_code != 200:
+                            return {"ok": False, "msg": f"HTTP {res.status_code}", "prices": []}
+                        root = ET.fromstring(res.content)
+                        header = root.find("header")
+                        if header is None or header.findtext("resultCode") != "000":
+                            msg = (header.findtext("resultMsg") if header is not None else "헤더 없음")
+                            return {"ok": False, "msg": msg, "prices": []}
+                        prices = []
+                        for item in root.findall(".//item"):
+                            name = (item.findtext("aptNm") or "").strip()
+                            if name == apt.strip():
+                                try:
+                                    p = int((item.findtext("dealAmount") or "0").replace(",", "").strip())
+                                    if p > 0:
+                                        prices.append(p)
+                                except ValueError:
+                                    pass
+                        return {"ok": True, "msg": "정상", "prices": prices}
+                    except Exception as e:
+                        return {"ok": False, "msg": str(e), "prices": []}
+
+                # 병렬 호출
+                raw = {}
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    future_to_ym = {
+                        executor.submit(_fetch_month_price, lawd_cd, original_apt_name, ym): ym
+                        for ym in months
+                    }
+                    done = 0
+                    for future in as_completed(future_to_ym):
+                        ym = future_to_ym[future]
+                        raw[ym] = future.result()
+                        done += 1
+                        progress_bar.progress(done / len(months), text=f"{done}/{len(months)}개월 완료...")
+
+                # 결과 정리 (월 순서 유지)
+                results = []
+                for ym in months:
+                    ym_format = f"{ym[:4]}-{ym[4:]}"
+                    data = raw[ym]
+                    if not data["ok"]:
+                        results.append({"거래년월": ym_format, "평균가(만원)": 0, "최저가(만원)": 0, "최고가(만원)": 0, "거래건수": -1, "비고": data["msg"]})
+                    elif data["prices"]:
+                        ps = sorted(data["prices"])
+                        results.append({"거래년월": ym_format, "평균가(만원)": round(sum(ps) / len(ps)), "최저가(만원)": ps[0], "최고가(만원)": ps[-1], "거래건수": len(ps), "비고": "정상"})
+                    else:
+                        results.append({"거래년월": ym_format, "평균가(만원)": 0, "최저가(만원)": 0, "최고가(만원)": 0, "거래건수": 0, "비고": "거래 없음"})
 
                 progress_bar.empty()
                 st.session_state["result_title"] = f"📈 [{selected_region}] {selected_apt_display} 시세 추이"
